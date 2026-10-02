@@ -1,0 +1,1553 @@
+-- =============================================================
+-- info.lua -- Elo 6554L Control
+--
+-- Plugin identity block. Embedded in the .qplug file and read by
+-- Q-SYS Designer when loading the plugin.
+--
+-- Version is injected from package.json by build.js. Do not edit
+-- it here.
+--
+-- Id is a stable GUID that uniquely identifies this plugin.
+-- Do not change it after the plugin has been deployed, or
+-- existing designs will lose the reference and need to be
+-- manually reconnected.
+-- =============================================================
+
+PluginInfo = {
+  Name = "Hybridsix Software~Elo 6554L Control",
+  Version = "0.1.0",
+  BuildVersion = "0.1.0.0",
+  Id = "791af0df-abb0-47c2-ad28-6580e602d157",
+  Author = "Michael King",
+  Description = "Control the Elo 6554L (ET6554L) interactive display from Q-SYS: display on / off (backlight), input, brightness and volume over Elo MDC on TCP port 5000, with temperature and usage-hour feedback.",
+}
+
+
+local __modules, __loaded = {}, {}
+local function require(name)
+  local m = __loaded[name]
+  if m ~= nil then return m end
+  local f = __modules[name]
+  if not f then error("module not found: " .. name, 2) end
+  m = f(name)
+  if m == nil then m = true end
+  __loaded[name] = m
+  return m
+end
+
+__modules["commands"] = function(...)
+-- Elo 6554L MDC command definitions and reply parsers.
+--
+-- Every command here comes from the Elo 6554L references (see
+-- ELO_6554L_COMMAND_REFERENCE.md). Do not add commands unless they are
+-- verified against Elo documentation or a real display.
+--
+-- Packets are built with Protocol, never stored as fixed strings, so the
+-- checksum is always computed. Parsers receive the return-data bytes (an
+-- array of numbers) and return the decoded value, or nil if the data is not
+-- in the documented shape.
+local Protocol = require("protocol")
+local Models = require("models")
+
+local Commands = {}
+
+-- MDC command bytes.
+Commands.Id = {
+  Brightness = 0x10,
+  Input = 0x60,
+  VolumeRelative = 0x61, -- documented but unused; absolute volume is preferred
+  Volume = 0x62,
+  Temperature = 0xB1,
+  Lifetime = 0xC0,
+  Power = 0xD6,
+  Serial = 0xE2,
+}
+
+-- Elo asks for at least 5 seconds of quiet after a serial-number query.
+Commands.SerialHold = 5.0
+
+-- Power / backlight data bytes: D6 00 01 = backlight on, D6 00 05 = off.
+Commands.BacklightOn = 0x01
+Commands.BacklightOff = 0x05
+
+Commands.Inputs = Models.Get(Models.Default).Inputs
+Commands.LevelRange = { Min = 0, Max = 100 }
+
+function Commands.Labels(list)
+  local labels = {}
+  for _, item in ipairs(list) do labels[#labels + 1] = item.Label end
+  return labels
+end
+
+function Commands.CodeForLabel(list, label)
+  for _, item in ipairs(list) do
+    if item.Label == label then return item.Code end
+  end
+  return nil
+end
+
+function Commands.LabelForCode(list, code)
+  for _, item in ipairs(list) do
+    if item.Code == code then return item.Label end
+  end
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Commands. `idempotent` means a retry after a timeout cannot double-trigger
+-- anything. `coalesce` means a newer request with the same key replaces one
+-- that is still waiting in the queue (used for slider drags).
+-- ---------------------------------------------------------------------------
+local function clamp(value, range)
+  local n = math.floor((tonumber(value) or range.Min) + 0.5)
+  if n < range.Min then n = range.Min end
+  if n > range.Max then n = range.Max end
+  return n
+end
+
+local function write(command, ...)
+  return {
+    packet = Protocol.BuildWrite(command, ...),
+    command = command,
+    kind = "write",
+    idempotent = true,
+  }
+end
+
+-- "Display On / Off" is the reversible backlight state, never a true power-off.
+Commands.DisplayOn = write(Commands.Id.Power, 0x00, Commands.BacklightOn)
+Commands.DisplayOff = write(Commands.Id.Power, 0x00, Commands.BacklightOff)
+
+function Commands.Input(code)
+  return write(Commands.Id.Input, code)
+end
+
+local function level(command, value)
+  local spec = write(command, 0x00, clamp(value, Commands.LevelRange))
+  spec.coalesce = true
+  return spec
+end
+
+function Commands.Brightness(value)
+  return level(Commands.Id.Brightness, value)
+end
+
+function Commands.Volume(value)
+  return level(Commands.Id.Volume, value)
+end
+
+-- ---------------------------------------------------------------------------
+-- Queries
+-- ---------------------------------------------------------------------------
+local function uint16(data, index)
+  return data[index] * 256 + data[index + 1]
+end
+
+-- Brightness and volume replies: 2 bytes maximum, 2 bytes current. The
+-- current value is normalized to 0-100 against the reported maximum.
+local function parseLevel(data)
+  if #data ~= 4 then return nil end
+  local max, current = uint16(data, 1), uint16(data, 3)
+  if max > 0 and max ~= 100 then
+    current = math.floor(current * 100 / max + 0.5)
+  end
+  if current < 0 or current > 100 then return nil end
+  return current
+end
+
+local function read(command, parse, extra)
+  local spec = {
+    packet = Protocol.BuildRead(command),
+    command = command,
+    kind = "read",
+    parse = parse,
+  }
+  for k, v in pairs(extra or {}) do spec[k] = v end
+  return spec
+end
+
+Commands.Queries = {
+  -- 00 01 = backlight on, 00 05 = backlight off. Anything else is not guessed.
+  power = read(Commands.Id.Power, function(data)
+    if #data < 2 or data[#data - 1] ~= 0x00 then return nil end
+    local state = data[#data]
+    if state == Commands.BacklightOn then return "On" end
+    if state == Commands.BacklightOff then return "Off" end
+    return nil
+  end),
+
+  -- Returns the input code byte; the runtime maps it to a label and shows an
+  -- unrecognized code as-is rather than hiding it.
+  input = read(Commands.Id.Input, function(data)
+    if #data < 1 then return nil end
+    return data[#data]
+  end),
+
+  brightness = read(Commands.Id.Brightness, parseLevel),
+  volume = read(Commands.Id.Volume, parseLevel),
+
+  -- 00 FF TT TT: temperature in degrees C is the last two bytes, big-endian.
+  temperature = read(Commands.Id.Temperature, function(data)
+    if #data ~= 4 then return nil end
+    return uint16(data, 3)
+  end),
+
+  -- 2 bytes display/system-on hours, 2 bytes backlight-on hours, big-endian.
+  lifetime = read(Commands.Id.Lifetime, function(data)
+    if #data ~= 4 then return nil end
+    return { display = uint16(data, 1), backlight = uint16(data, 3) }
+  end),
+
+  -- The reply layout is not documented; show the printable characters, or hex
+  -- if there are none.
+  serial = read(Commands.Id.Serial, function(data)
+    if #data < 1 then return nil end
+    local chars = {}
+    for _, byte in ipairs(data) do
+      if byte >= 0x20 and byte <= 0x7E then chars[#chars + 1] = string.char(byte) end
+    end
+    local text = table.concat(chars)
+    if text == "" then
+      local hex = {}
+      for i, byte in ipairs(data) do hex[i] = string.format("%02X", byte) end
+      text = table.concat(hex, " ")
+    end
+    return text
+  end, { hold = Commands.SerialHold }),
+}
+
+return Commands
+
+end
+
+__modules["engine"] = function(...)
+-- Transport state machine with a serialized request queue.
+--
+-- The engine is transport-agnostic. It is driven by:
+--   Tick(now)            called periodically (seconds, monotonic)
+--   OnConnected()        socket connected
+--   OnData(bytes)        raw bytes received (any segmentation)
+--   OnClosed(reason)     socket closed or errored
+-- and talks to the outside through deps:
+--   send(bytes), connect(), disconnect(), log(kind, msg), onState(state, detail)
+--   onVerified(ok, value, raw)   optional; result of the verification query
+--
+-- States: Disconnected, Connecting, Verifying, Ready.
+--
+-- A connection is only trusted after the display answers a lightweight query
+-- (options.Verify, a read spec) with a valid MDC frame. Only one request is
+-- ever in flight. UI commands go ahead of queued polls. A request may ask for
+-- a quiet period afterwards (spec.hold), used after the serial-number query.
+local Protocol = require("protocol")
+
+local Engine = {}
+Engine.__index = Engine
+
+Engine.Defaults = {
+  ResponseTimeout = 2.0, -- seconds to wait for a reply
+  ConnectTimeout = 10.0, -- seconds to wait for the socket to connect
+  MaxFailures = 3,       -- consecutive timeouts before reconnecting
+  MaxQueue = 50,
+  ReconnectMin = 5.0,    -- first reconnect delay; doubles up to ReconnectMax
+  ReconnectMax = 30.0,
+  Verify = nil,          -- read spec sent after connecting
+}
+
+function Engine.New(deps, options)
+  local self = setmetatable({}, Engine)
+  self.deps = deps
+  self.opt = {}
+  for k, v in pairs(Engine.Defaults) do self.opt[k] = v end
+  for k, v in pairs(options or {}) do self.opt[k] = v end
+  self.state = "Disconnected"
+  self.queue = {}
+  self.inflight = nil
+  self.failures = 0
+  self.now = 0
+  self.holdUntil = 0
+  self.nextConnectAt = 0
+  self.backoff = self.opt.ReconnectMin
+  self.enabled = false
+  self.session = false
+  self.receiver = Protocol.NewReceiver()
+  return self
+end
+
+function Engine:_log(kind, message)
+  if self.deps.log then self.deps.log(kind, message) end
+end
+
+function Engine:_setState(state, detail)
+  self.state = state
+  self.detail = detail
+  if self.deps.onState then self.deps.onState(state, detail) end
+end
+
+function Engine:IsReady()
+  return self.state == "Ready"
+end
+
+function Engine:QueueDepth()
+  return #self.queue + (self.inflight and 1 or 0)
+end
+
+function Engine:Start(now)
+  self.enabled = true
+  self.now = now or self.now
+  self.nextConnectAt = self.now
+end
+
+function Engine:Stop()
+  self.enabled = false
+  if self.session then
+    self.deps.disconnect()
+    self:_closed("stopped")
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Requests
+-- ---------------------------------------------------------------------------
+function Engine:_resolve(req, ok, value, raw)
+  if req.hold then self.holdUntil = self.now + req.hold end
+  if req.callback then req.callback(ok, value, raw) end
+end
+
+function Engine:_failAll(reason)
+  local pending = {}
+  if self.inflight then
+    pending[#pending + 1] = self.inflight
+    self.inflight = nil
+  end
+  for _, req in ipairs(self.queue) do pending[#pending + 1] = req end
+  self.queue = {}
+  for _, req in ipairs(pending) do self:_resolve(req, false, reason) end
+end
+
+function Engine:_enqueue(req)
+  if self.state ~= "Ready" then
+    self:_resolve(req, false, "not connected")
+    return false
+  end
+  if req.key then
+    if req.coalesce then
+      -- A newer value replaces one still waiting in the queue. The replaced
+      -- request is resolved as "superseded" so callers can keep their books.
+      for _, queued in ipairs(self.queue) do
+        if queued.key == req.key then
+          local old = queued.callback
+          queued.packet = req.packet
+          queued.callback = req.callback
+          if old then old(false, "superseded") end
+          return true
+        end
+      end
+    else
+      -- A request with a key is dropped if one with the same key is pending.
+      if self.inflight and self.inflight.key == req.key then return false end
+      for _, queued in ipairs(self.queue) do
+        if queued.key == req.key then return false end
+      end
+    end
+  end
+  if #self.queue >= self.opt.MaxQueue then
+    self:_resolve(req, false, "queue full")
+    return false
+  end
+  if req.kind == "write" then
+    -- Writes go after earlier writes but ahead of queued reads.
+    local pos = 1
+    while pos <= #self.queue and self.queue[pos].kind == "write" do pos = pos + 1 end
+    table.insert(self.queue, pos, req)
+  else
+    self.queue[#self.queue + 1] = req
+  end
+  self:_dispatch()
+  return true
+end
+
+-- spec: { packet = <bytes>, command = 0xNN, idempotent = true, coalesce = false }
+-- callback(ok, value, raw): ok=false carries a reason string in `value`;
+-- `raw` is the reply frame as hex text when there was one.
+function Engine:Command(key, spec, callback)
+  return self:_enqueue({
+    key = key,
+    packet = spec.packet,
+    command = spec.command,
+    kind = "write",
+    retries = spec.idempotent and 1 or 0,
+    coalesce = spec.coalesce,
+    hold = spec.hold,
+    callback = callback,
+  })
+end
+
+-- spec: { packet = <bytes>, command = 0xNN, parse = function(data) -> value|nil }
+function Engine:Query(key, spec, callback)
+  return self:_enqueue({
+    key = key,
+    packet = spec.packet,
+    command = spec.command,
+    kind = "read",
+    parse = spec.parse,
+    retries = 1,
+    hold = spec.hold,
+    callback = callback,
+  })
+end
+
+-- Sends caller-supplied bytes as they are and resolves with the first valid
+-- frame received. Never retried.
+function Engine:Raw(key, packet, callback)
+  return self:_enqueue({
+    key = key,
+    packet = packet,
+    kind = "raw",
+    raw = true,
+    retries = 0,
+    callback = callback,
+  })
+end
+
+function Engine:_send(req)
+  req.attempts = (req.attempts or 0) + 1
+  req.sentAt = self.now
+  self.inflight = req
+  self:_log("tx", Protocol.ToHex(req.packet))
+  self.deps.send(req.packet)
+end
+
+function Engine:_dispatch()
+  if self.state ~= "Ready" or self.inflight then return end
+  if self.now < self.holdUntil then return end
+  local req = table.remove(self.queue, 1)
+  if not req then return end
+  self:_send(req)
+end
+
+function Engine:_checkTimeout()
+  local req = self.inflight
+  if not req or self.now - req.sentAt < self.opt.ResponseTimeout then return end
+  self.inflight = nil
+  self.failures = self.failures + 1
+  self:_log("warn", "timeout waiting for command " .. string.format("%02X", req.command or 0))
+
+  if self.state == "Verifying" then
+    self:_resolve(req, false, "timeout")
+    self.deps.disconnect()
+    self:_closed("no response")
+    return
+  end
+  if self.failures >= self.opt.MaxFailures then
+    self:_resolve(req, false, "timeout")
+    self.deps.disconnect()
+    self:_closed("no response")
+    return
+  end
+  if req.attempts <= req.retries then
+    table.insert(self.queue, 1, req)
+  else
+    self:_resolve(req, false, "timeout")
+  end
+  self:_dispatch()
+end
+
+-- ---------------------------------------------------------------------------
+-- Connection lifecycle
+-- ---------------------------------------------------------------------------
+function Engine:_closed(reason)
+  if not self.session then return end
+  self.session = false
+  self.receiver:Reset()
+  self.holdUntil = 0
+  self:_setState("Disconnected", reason)
+  self:_failAll(reason)
+  self.failures = 0
+  self.nextConnectAt = self.now + self.backoff
+  self:_log("info", string.format("reconnect in %.0fs (%s)", self.backoff, tostring(reason)))
+  self.backoff = math.min(self.backoff * 2, self.opt.ReconnectMax)
+end
+
+function Engine:_ready()
+  self:_setState("Ready")
+  self:_dispatch()
+end
+
+function Engine:OnConnected()
+  self.session = true
+  self.failures = 0
+  self.receiver:Reset()
+  local verify = self.opt.Verify
+  if not verify then
+    self:_ready()
+    return
+  end
+  -- Connected is only claimed once the display answers a valid MDC frame.
+  self:_setState("Verifying")
+  self:_send({
+    kind = "read",
+    packet = verify.packet,
+    command = verify.command,
+    parse = verify.parse,
+    retries = 0,
+    callback = function(ok, value, raw)
+      if self.deps.onVerified then self.deps.onVerified(ok, value, raw) end
+    end,
+  })
+end
+
+function Engine:OnClosed(reason)
+  self:_closed(reason or "closed")
+end
+
+function Engine:Tick(now)
+  self.now = now
+  local state = self.state
+  if state == "Disconnected" then
+    if self.enabled and now >= self.nextConnectAt then
+      self.session = true
+      self.connectDeadline = now + self.opt.ConnectTimeout
+      self:_setState("Connecting")
+      self.deps.connect()
+    end
+  elseif state == "Connecting" then
+    if now >= self.connectDeadline then
+      self.deps.disconnect()
+      self:_closed("connect timeout")
+    end
+  elseif state == "Verifying" then
+    self:_checkTimeout()
+  elseif state == "Ready" then
+    self:_checkTimeout()
+    self:_dispatch()
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Receive path
+-- ---------------------------------------------------------------------------
+function Engine:OnData(bytes)
+  if not self.session then return end
+  for _, item in ipairs(self.receiver:Feed(bytes)) do
+    if item.ok then
+      self:_onFrame(item)
+    else
+      self:_log("warn", string.format("discarded (%s): %s", item.reason, Protocol.ToHex(item.raw)))
+    end
+  end
+end
+
+function Engine:_onFrame(frame)
+  local hex = Protocol.ToHex(frame.raw)
+  self:_log("rx", hex)
+
+  local req = self.inflight
+  if not req then
+    self:_log("warn", "unsolicited frame: " .. hex)
+    return
+  end
+
+  if req.raw then
+    self.inflight = nil
+    self.failures = 0
+    self.backoff = self.opt.ReconnectMin
+    self:_resolve(req, true, nil, hex)
+    self:_dispatch()
+    return
+  end
+
+  local status, detail = Protocol.Interpret(frame.body, req.kind, req.command)
+  if status == "mismatch" then
+    -- Not the answer to the request in flight; keep waiting for the real one.
+    self:_log("warn", "frame for a different command ignored: " .. hex)
+    return
+  end
+  self.inflight = nil
+
+  -- Any reply that answers the request, even an error, proves the link works.
+  self.failures = 0
+  self.backoff = self.opt.ReconnectMin
+  if self.state == "Verifying" then self:_setState("Ready") end
+
+  if status == "ok" then
+    if req.parse then
+      local value = req.parse(detail)
+      if value == nil then
+        self:_resolve(req, false, "unexpected reply", hex)
+      else
+        self:_resolve(req, true, value, hex)
+      end
+    else
+      self:_resolve(req, true, nil, hex)
+    end
+  elseif status == "error" then
+    self:_resolve(req, false, detail, hex)
+  else
+    self:_resolve(req, false, "unexpected reply", hex)
+  end
+
+  self:_dispatch()
+end
+
+return Engine
+
+end
+
+__modules["models"] = function(...)
+-- Model registry plus data shared by design-time and runtime code.
+--
+-- The Elo 6554L is the only supported model. Everything model specific
+-- (identity, default port, input choices and their MDC codes) lives here so
+-- another IDS54-family display could be added without touching the engine.
+local Models = {
+  ById = {},
+  Default = "Elo 6554L",
+}
+
+Models.ById["Elo 6554L"] = {
+  Id = "Elo 6554L",
+  Name = "Elo 6554L",
+  Model = "ET6554L",
+  Family = "IDS54",
+  SizeInches = 65,
+  DefaultPort = 5000,
+  -- Order is the order shown in the Input combo box. Codes are the value
+  -- byte of the MDC input command (0x60).
+  Inputs = {
+    { Label = "HDMI 1", Code = 0x20 },
+    { Label = "HDMI 2", Code = 0x10 },
+    { Label = "DisplayPort", Code = 0x40 },
+    { Label = "USB-C", Code = 0x08 },
+  },
+}
+
+function Models.Get(id)
+  return Models.ById[id] or Models.ById[Models.Default]
+end
+
+return Models
+
+end
+
+__modules["poller"] = function(...)
+-- Conservative polling scheduler.
+--
+-- Intervals (seconds) depend on the last known display state:
+--   Unknown : only the power/backlight state is polled
+--   Off     : only the power/backlight state (backlight is off)
+--   On      : everything, each item at its own pace
+--
+-- "normal" means the configurable normal poll interval. A boosted key (see
+-- Boost) is polled at the high-rate interval until it is ended or times out.
+-- An item marked Once is polled until it succeeds, then left alone until the
+-- next reconnect (Interval is then only the retry pace).
+local Commands = require("commands")
+
+local Poller = {}
+Poller.__index = Poller
+
+Poller.Schedule = {
+  { Key = "power", Interval = { On = "normal", Off = "normal", Unknown = "normal" } },
+  { Key = "input", Interval = { On = "normal" } },
+  { Key = "brightness", Interval = { On = 5 } },
+  { Key = "volume", Interval = { On = 5 } },
+  { Key = "temperature", Interval = { On = 15 } },
+  { Key = "lifetime", Interval = { On = 60 } },
+}
+
+-- handlers[key](ok, value, raw) receives each poll result.
+-- options: NormalInterval, HighRateInterval (seconds).
+function Poller.New(engine, handlers, options)
+  options = options or {}
+  local self = setmetatable({}, Poller)
+  self.engine = engine
+  self.handlers = handlers
+  self.last = {}
+  self.boost = {}
+  self.done = {}
+  self.power = nil
+  self.now = 0
+  self.options = {
+    NormalInterval = options.NormalInterval or 3,
+    HighRateInterval = options.HighRateInterval or 1,
+  }
+  return self
+end
+
+function Poller:_poll(item)
+  self.last[item.Key] = self.now
+  local handler = self.handlers[item.Key]
+  self.engine:Query(item.Key, Commands.Queries[item.Key], function(ok, value, raw)
+    if ok and item.Once then self.done[item.Key] = true end
+    if handler then handler(ok, value, raw) end
+  end)
+end
+
+-- Poll `key` at the high-rate interval until EndBoost or `timeout` seconds.
+function Poller:Boost(key, timeout)
+  self.boost[key] = self.now + timeout
+end
+
+function Poller:EndBoost(key)
+  self.boost[key] = nil
+end
+
+function Poller:IsBoosted(key)
+  return self.boost[key] ~= nil
+end
+
+function Poller:Tick(now)
+  self.now = now
+  for key, expires in pairs(self.boost) do
+    if now > expires then self.boost[key] = nil end
+  end
+  if not self.engine:IsReady() then return end
+  local state = self.power or "Unknown"
+  for _, item in ipairs(Poller.Schedule) do
+    if not (item.Once and self.done[item.Key]) then
+      local interval = item.Interval[state]
+      if self.boost[item.Key] then interval = self.options.HighRateInterval end
+      if interval == "normal" then interval = self.options.NormalInterval end
+      if interval then
+        local last = self.last[item.Key]
+        if last == nil or now - last >= interval then
+          self:_poll(item)
+        end
+      end
+    end
+  end
+end
+
+-- Poll one item as soon as possible (for example after sending a command).
+function Poller:PollNow(key)
+  if not self.engine:IsReady() then return end
+  for _, item in ipairs(Poller.Schedule) do
+    if item.Key == key then
+      self:_poll(item)
+      return
+    end
+  end
+end
+
+-- "On", "Off" or nil (unknown). Becoming On makes everything due.
+function Poller:SetPower(state)
+  if state == self.power then return end
+  self.power = state
+  if state == "On" then
+    for _, item in ipairs(Poller.Schedule) do
+      if item.Key ~= "power" then self.last[item.Key] = nil end
+    end
+  end
+end
+
+-- Forget all timing, boosts and power state (call on disconnect).
+function Poller:Reset()
+  self.last = {}
+  self.boost = {}
+  self.done = {}
+  self.power = nil
+end
+
+return Poller
+
+end
+
+__modules["protocol"] = function(...)
+-- Elo MDC protocol over TCP: packet builder, receive framing, checksum and
+-- reply interpretation.
+--
+-- Wire format (from the Elo IDS04/54 MDC application note), all raw bytes:
+--   host -> display : 02 6E <LEN> FF <R/W> <CMD> [data...] <CS> 03
+--   display -> host : 02 <host> <LEN> <slave> <R/W | error> <CMD> [data...] <CS> 03
+-- LEN = 0x80 + number of bytes between LEN and CS. CS = sum of every byte
+-- between START and CS (exclusive), modulo 256. A TCP read is not a frame:
+-- Receiver reassembles frames from arbitrary segments using LEN.
+--
+-- Everything is a Lua string of raw bytes. Hex text is for logs only and is
+-- never sent.
+local Protocol = {}
+
+Protocol.START = 0x02
+Protocol.HOST = 0x6E
+Protocol.TARGET = 0xFF
+Protocol.READ = 0x01
+Protocol.WRITE = 0x04
+Protocol.STOP = 0x03
+Protocol.MAX_BODY = 32 -- largest LEN-0x80 accepted; guards against garbage
+
+-- ---------------------------------------------------------------------------
+-- Checksum and builders
+-- ---------------------------------------------------------------------------
+function Protocol.Checksum(bytes)
+  local sum = 0
+  for _, value in ipairs(bytes) do sum = (sum + value) % 256 end
+  return sum
+end
+
+local function toString(bytes)
+  local out = {}
+  for i, value in ipairs(bytes) do out[i] = string.char(value) end
+  return table.concat(out)
+end
+
+-- rw: Protocol.READ or Protocol.WRITE. data: array of bytes (may be nil).
+-- Returns the packet as a raw byte string.
+function Protocol.Build(rw, command, data)
+  data = data or {}
+  local length = 0x80 + 3 + #data
+  local body = { Protocol.HOST, length, Protocol.TARGET, rw, command }
+  for _, value in ipairs(data) do body[#body + 1] = value end
+  local packet = { Protocol.START }
+  for _, value in ipairs(body) do packet[#packet + 1] = value end
+  packet[#packet + 1] = Protocol.Checksum(body)
+  packet[#packet + 1] = Protocol.STOP
+  return toString(packet)
+end
+
+function Protocol.BuildRead(command)
+  return Protocol.Build(Protocol.READ, command)
+end
+
+-- Variadic data bytes: BuildWrite(0xD6, 0x00, 0x01).
+function Protocol.BuildWrite(command, ...)
+  return Protocol.Build(Protocol.WRITE, command, { ... })
+end
+
+-- ---------------------------------------------------------------------------
+-- Hex helpers (logging and the raw-command box only)
+-- ---------------------------------------------------------------------------
+function Protocol.ToHex(text)
+  local out = {}
+  for i = 1, #text do out[i] = string.format("%02X", text:byte(i)) end
+  return table.concat(out, " ")
+end
+
+-- Turns "02 6E 83 FF 01 B1 A2 03" (spaces, commas and 0x prefixes allowed)
+-- into a raw byte string. Returns nil and a reason on bad input.
+function Protocol.ParseHex(text)
+  local cleaned = tostring(text or ""):gsub("0[xX]", ""):gsub("[%s,]+", "")
+  if cleaned == "" then return nil, "empty" end
+  if not cleaned:match("^%x+$") then return nil, "not hexadecimal" end
+  if #cleaned % 2 ~= 0 then return nil, "odd number of digits" end
+  if #cleaned > 128 then return nil, "too long" end
+  local out = {}
+  for pair in cleaned:gmatch("%x%x") do out[#out + 1] = string.char(tonumber(pair, 16)) end
+  return table.concat(out)
+end
+
+-- ---------------------------------------------------------------------------
+-- Receive framing
+-- ---------------------------------------------------------------------------
+local Receiver = {}
+Receiver.__index = Receiver
+
+function Protocol.NewReceiver()
+  return setmetatable({ buffer = "" }, Receiver)
+end
+
+function Receiver:Reset()
+  self.buffer = ""
+end
+
+-- Appends `chunk` and returns every complete item found, in order:
+--   { ok = true,  raw = <frame>, body = { slave, rw|error, cmd, data... } }
+--   { ok = false, raw = <bytes discarded>, reason = <text> }
+-- Incomplete data stays buffered for the next call.
+function Receiver:Feed(chunk)
+  local items = {}
+  self.buffer = self.buffer .. (chunk or "")
+  while true do
+    local buf = self.buffer
+    local start = buf:find("\2", 1, true)
+    if not start then
+      if #buf > 0 then items[#items + 1] = { ok = false, raw = buf, reason = "no start byte" } end
+      self.buffer = ""
+      break
+    end
+    if start > 1 then
+      items[#items + 1] = { ok = false, raw = buf:sub(1, start - 1), reason = "bytes before start" }
+      buf = buf:sub(start)
+      self.buffer = buf
+    end
+    if #buf < 3 then break end
+
+    local n = buf:byte(3) - 0x80
+    if n < 1 or n > Protocol.MAX_BODY then
+      items[#items + 1] = { ok = false, raw = buf:sub(1, 1), reason = "bad length" }
+      self.buffer = buf:sub(2)
+    else
+      local size = n + 5 -- START HOST LEN <n bytes> CS STOP
+      if #buf < size then break end
+      local frame = buf:sub(1, size)
+      local sum = 0
+      for i = 2, n + 3 do sum = (sum + frame:byte(i)) % 256 end
+      if frame:byte(size) ~= Protocol.STOP then
+        items[#items + 1] = { ok = false, raw = frame:sub(1, 1), reason = "bad stop byte" }
+        self.buffer = buf:sub(2)
+      elseif frame:byte(size - 1) ~= sum then
+        items[#items + 1] = { ok = false, raw = frame:sub(1, 1), reason = "bad checksum" }
+        self.buffer = buf:sub(2)
+      else
+        local body = {}
+        for i = 4, n + 3 do body[#body + 1] = frame:byte(i) end
+        items[#items + 1] = { ok = true, raw = frame, body = body }
+        self.buffer = buf:sub(size + 1)
+      end
+    end
+  end
+  return items
+end
+
+-- ---------------------------------------------------------------------------
+-- Reply interpretation
+-- ---------------------------------------------------------------------------
+-- Write replies carry an error code (0x04 = no error); error codes other than
+-- 0x04 mean the command failed. The code is shown to the operator as "E<hex>".
+Protocol.ERR_NONE = 0x04
+
+Protocol.Errors = {
+  E01 = "Unsupported Command",
+  E00 = "Device Error",
+  E02 = "Device Error",
+  E03 = "Device Error",
+  E05 = "Device Error",
+}
+
+function Protocol.ErrorKey(code)
+  return string.format("E%02X", code)
+end
+
+function Protocol.ErrorText(key)
+  local text = Protocol.Errors[key] or "Device Error"
+  return text
+end
+
+-- body = { slave, rw|error, cmd, data... } from Receiver:Feed.
+-- Returns one of:
+--   "ok", data                  data = array of return bytes (empty for writes)
+--   "error", errorKey           display reported an error for this command
+--   "mismatch"                  frame answers a different command
+--   "malformed"                 frame shape does not fit the request
+function Protocol.Interpret(body, kind, command)
+  if #body < 3 then return "malformed" end
+  if body[3] ~= command then return "mismatch" end
+  local flag = body[2]
+
+  if kind == "read" then
+    if #body >= 4 and flag == Protocol.READ then
+      local data = {}
+      for i = 4, #body do data[#data + 1] = body[i] end
+      return "ok", data
+    end
+    if #body == 3 then return "error", Protocol.ErrorKey(flag) end
+    return "malformed"
+  end
+
+  if #body ~= 3 then return "malformed" end
+  if flag == Protocol.ERR_NONE then return "ok", {} end
+  return "error", Protocol.ErrorKey(flag)
+end
+
+return Protocol
+
+end
+
+__modules["runtime"] = function(...)
+-- Runtime wiring: Q-SYS controls <-> engine/poller <-> TCP socket.
+--
+-- Called once from plugin.lua when `Controls` exists. All display traffic
+-- goes through the engine queue; control handlers never write to the socket.
+-- Controls show what the display reports, never what was merely requested.
+-- Connection state (Connected / Status) is kept separate from the display
+-- state (DisplayState / DisplayText): "Online" with the backlight off is a
+-- healthy exhibit condition.
+return function()
+  local Models = require("models")
+  local Protocol = require("protocol")
+  local Commands = require("commands")
+  local Engine = require("engine")
+  local Poller = require("poller")
+
+  local TICK = 0.1
+
+  local model = Models.Get(Models.Default)
+  local ip = Properties["IP Address"].Value
+  local port = Properties["Port"].Value
+  local debugMode = Properties["Debug Print"].Value
+  local normalPoll = tonumber(Properties["Normal Poll Interval (s)"].Value) or 3
+  local highPoll = tonumber(Properties["High Poll Interval (s)"].Value) or 1
+  local highTimeout = tonumber(Properties["High Poll Timeout (s)"].Value) or 30
+
+  local function dbg(kind, message)
+    if debugMode == "All" or (debugMode == "Tx/Rx" and (kind == "tx" or kind == "rx")) then
+      print(string.format("[Elo 6554L %s] %s", kind, tostring(message)))
+    end
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Control helpers. Programmatic changes also fire EventHandlers, so
+  -- feedback writes are wrapped to keep them from being sent back out.
+  -- -------------------------------------------------------------------------
+  local updating = false
+
+  local function setText(control, value)
+    if control.String ~= value then control.String = value end
+  end
+
+  local function setFlag(control, value)
+    updating = true
+    control.Boolean = value
+    updating = false
+  end
+
+  local function setNumber(control, value)
+    updating = true
+    control.Value = value
+    updating = false
+  end
+
+  local function setChoice(control, value)
+    updating = true
+    control.String = value
+    updating = false
+  end
+
+  local function detail(message)
+    setText(Controls.StatusDetail, message or "")
+  end
+
+  local function setError(key)
+    setText(Controls.LastError, string.format("%s (%s)", Protocol.ErrorText(key), key))
+  end
+
+  -- A failed request: show a display-reported error in LastError, anything
+  -- else (timeout, unparsable reply) in StatusDetail. The last good value is
+  -- never replaced on failure.
+  local function failed(label, reason, raw)
+    if tostring(reason):match("^E%x%x$") then
+      setError(reason)
+      detail(label .. " failed: " .. Protocol.ErrorText(reason))
+    elseif raw then
+      detail(label .. " reply not understood: " .. tostring(raw))
+    elseif reason ~= "superseded" then
+      detail(label .. " failed: " .. tostring(reason))
+    end
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Engine and socket
+  -- -------------------------------------------------------------------------
+  local sock = TcpSocket.New()
+  sock.ReconnectTimeout = 0 -- reconnects are driven by the engine
+
+  local poller -- assigned below; handlers refer to it
+  local known = { brightness = 0, volume = 0 }
+  -- Slider changes still waiting for a reply; poll results are ignored while
+  -- any are outstanding so a drag does not snap back to an older value.
+  local pending = { brightness = 0, volume = 0 }
+
+  -- After a command, the affected key is polled at the high rate until the
+  -- display reports the expected value or the high-rate timeout passes.
+  local waiting = {}
+
+  local function expect(key, test)
+    waiting[key] = test
+    poller:Boost(key, highTimeout)
+    poller:PollNow(key)
+  end
+
+  local function settled(key, value)
+    local test = waiting[key]
+    if test and test(value) then
+      waiting[key] = nil
+      poller:EndBoost(key)
+    end
+  end
+
+  local COMM_ERRORS = { ["no response"] = true, ["connect timeout"] = true, ["socket error"] = true }
+
+  local function showDisplayUnknown()
+    setFlag(Controls.DisplayState, false)
+    setText(Controls.DisplayText, "Unknown")
+  end
+
+  local handlers = {}
+
+  local function onState(state, why)
+    if state == "Ready" then
+      Controls.Connected.Boolean = true
+      Controls.Status.Value = 0
+      Controls.Status.String = "OK"
+      detail("")
+      Log.Message("Elo 6554L connected: " .. tostring(ip))
+      return
+    end
+
+    Controls.Connected.Boolean = false
+    if poller then poller:Reset() end
+    showDisplayUnknown()
+
+    if state == "Connecting" then
+      Controls.Status.Value = 5
+      Controls.Status.String = "Connecting..."
+    elseif state == "Verifying" then
+      Controls.Status.Value = 5
+      Controls.Status.String = "Verifying..."
+    elseif COMM_ERRORS[why] then
+      Controls.Status.Value = 2
+      Controls.Status.String = "Communication error"
+      detail(tostring(why))
+    else
+      Controls.Status.Value = 4
+      Controls.Status.String = "Disconnected"
+      detail(why and tostring(why) or "")
+    end
+  end
+
+  local engine = Engine.New({
+    send = function(data) sock:Write(data) end,
+    connect = function() sock:Connect(ip, port) end,
+    disconnect = function() sock:Disconnect() end,
+    log = function(kind, message)
+      dbg(kind, message)
+      if kind == "tx" then setText(Controls.LastCommand, message) end
+      if kind == "rx" then setText(Controls.LastResponse, message) end
+    end,
+    onState = onState,
+    -- The reply that proved the link also tells us the display state.
+    onVerified = function(ok, value, raw)
+      if ok then
+        handlers.power(true, value, raw)
+      elseif raw then
+        failed("Display state", value, raw)
+      end
+    end,
+  }, {
+    Verify = Commands.Queries.power,
+  })
+
+  -- -------------------------------------------------------------------------
+  -- Poll feedback
+  -- -------------------------------------------------------------------------
+  function handlers.power(ok, value, raw)
+    if not ok then
+      failed("Display state", value, raw)
+      return
+    end
+    setFlag(Controls.DisplayState, value == "On")
+    setText(Controls.DisplayText, value == "On" and "On" or "Backlight Off")
+    poller:SetPower(value)
+    settled("power", value)
+  end
+
+  function handlers.input(ok, value, raw)
+    if not ok then
+      failed("Input", value, raw)
+      return
+    end
+    local label = Commands.LabelForCode(model.Inputs, value)
+    if label then
+      setChoice(Controls.Input, label)
+    else
+      local unknown = string.format("Unknown (0x%02X)", value)
+      setChoice(Controls.Input, unknown)
+      detail("Unrecognized input reply: " .. unknown)
+    end
+    settled("input", label or value)
+  end
+
+  local function levelHandler(key, controlName, label)
+    return function(ok, value, raw)
+      if not ok then
+        failed(label, value, raw)
+        return
+      end
+      known[key] = value
+      if pending[key] > 0 then return end
+      setNumber(Controls[controlName], value)
+      settled(key, value)
+    end
+  end
+
+  handlers.brightness = levelHandler("brightness", "Brightness", "Brightness")
+  handlers.volume = levelHandler("volume", "Volume", "Volume")
+
+  function handlers.temperature(ok, value, raw)
+    if not ok then
+      failed("Temperature", value, raw)
+      return
+    end
+    setText(Controls.TemperatureC, tostring(value))
+  end
+
+  function handlers.lifetime(ok, value, raw)
+    if not ok then
+      failed("Usage hours", value, raw)
+      return
+    end
+    setText(Controls.DisplayPowerHours, tostring(value.display))
+    setText(Controls.BacklightHours, tostring(value.backlight))
+  end
+
+  function handlers.serial(ok, value, raw)
+    if not ok then
+      failed("Serial number", value, raw)
+      return
+    end
+    setText(Controls.SerialNumber, value)
+    detail("")
+  end
+
+  poller = Poller.New(engine, handlers, {
+    NormalInterval = normalPoll,
+    HighRateInterval = highPoll,
+  })
+
+  -- -------------------------------------------------------------------------
+  -- Socket events
+  -- -------------------------------------------------------------------------
+  sock.EventHandler = function(_, event, err)
+    if event == TcpSocket.Events.Connected then
+      engine:OnConnected()
+    elseif event == TcpSocket.Events.Data then
+      -- TCP is a stream: hand over whatever arrived; the engine reassembles
+      -- frames from the length byte.
+      local available = sock.BufferLength
+      while available and available > 0 do
+        local data = sock:Read(available)
+        if not data then break end
+        engine:OnData(data)
+        available = sock.BufferLength
+      end
+    elseif event == TcpSocket.Events.Closed then
+      engine:OnClosed("closed")
+    elseif event == TcpSocket.Events.Error or event == TcpSocket.Events.Timeout then
+      engine:OnClosed("socket error")
+    end
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Control handlers (enqueue only)
+  -- -------------------------------------------------------------------------
+  -- Coalescing commands (slider drags) use their name as the queue key.
+  local function send(name, spec, after)
+    engine:Command(spec.coalesce and name or nil, spec, function(ok, reason, raw)
+      if not ok then failed(name, reason, nil) end
+      if after then after(ok, reason) end
+    end)
+  end
+
+  Controls.DisplayOn.EventHandler = function()
+    send("Display on", Commands.DisplayOn, function(ok)
+      if ok then expect("power", function(v) return v == "On" end) end
+    end)
+  end
+  Controls.DisplayOff.EventHandler = function()
+    send("Display off", Commands.DisplayOff, function(ok)
+      if ok then expect("power", function(v) return v == "Off" end) end
+    end)
+  end
+
+  Controls.Input.Choices = Commands.Labels(model.Inputs)
+  Controls.Input.EventHandler = function(control)
+    if updating then return end
+    local wanted = control.String
+    local code = Commands.CodeForLabel(model.Inputs, wanted)
+    if not code then
+      detail("Unknown input: " .. tostring(wanted))
+      return
+    end
+    send("Input", Commands.Input(code), function(ok)
+      if ok then expect("input", function(v) return v == wanted end) end
+    end)
+  end
+
+  local function bindLevel(controlName, key, build, label)
+    Controls[controlName].EventHandler = function(control)
+      if updating then return end
+      local wanted = math.floor((tonumber(control.Value) or 0) + 0.5)
+      pending[key] = pending[key] + 1
+      send(label, build(wanted), function(ok, reason)
+        pending[key] = pending[key] - 1
+        if reason == "superseded" then return end
+        if ok then
+          expect(key, function(v) return v == wanted end)
+        elseif pending[key] == 0 then
+          setNumber(Controls[controlName], known[key])
+        end
+      end)
+    end
+  end
+
+  bindLevel("Brightness", "brightness", Commands.Brightness, "Brightness")
+  bindLevel("Volume", "volume", Commands.Volume, "Volume")
+
+  -- Technician action: Elo requires a 5 second pause after this query, which
+  -- the engine enforces, so it is not part of the regular poll.
+  Controls.ReadSerial.EventHandler = function()
+    detail("Reading serial number; the display needs 5 s before the next command")
+    engine:Query("serial", Commands.Queries.serial, handlers.serial)
+  end
+
+  Controls.CustomCommand.String = Protocol.ToHex(Commands.Queries.temperature.packet)
+  Controls.CustomReply.String = "Ready"
+  Controls.CustomSend.EventHandler = function()
+    local packet, why = Protocol.ParseHex(Controls.CustomCommand.String)
+    if not packet then
+      setText(Controls.CustomReply, "Invalid hex: " .. tostring(why))
+      return
+    end
+    -- Sent exactly as typed, never retried.
+    engine:Raw("custom", packet, function(ok, value, raw)
+      if ok then
+        setText(Controls.CustomReply, raw or "OK")
+      else
+        setText(Controls.CustomReply, tostring(value or "Failed"))
+      end
+    end)
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Static info and start-up
+  -- -------------------------------------------------------------------------
+  Controls.Model.String = model.Name
+  Controls.IPAddress.String = tostring(ip) .. ":" .. tostring(port)
+  Controls.Connected.Boolean = false
+  Controls.QueueDepth.String = "0"
+  showDisplayUnknown()
+
+  local clock = 0
+  local lastDepth = 0
+  local ticker = Timer.New()
+  ticker.EventHandler = function()
+    clock = clock + TICK
+    engine:Tick(clock)
+    poller:Tick(clock)
+    local depth = engine:QueueDepth()
+    if depth ~= lastDepth then
+      lastDepth = depth
+      setText(Controls.QueueDepth, tostring(depth))
+    end
+  end
+
+  if ip == nil or ip == "" or ip == "0.0.0.0" then
+    Controls.Status.Value = 2
+    Controls.Status.String = "Set the IP Address property"
+    return
+  end
+
+  Controls.Status.Value = 4
+  Controls.Status.String = "Disconnected"
+  engine:Start(clock)
+  ticker:Start(TICK)
+end
+
+end
+
+-- =============================================================
+-- plugin.lua
+-- Elo 6554L Control
+-- Author: Michael King
+--
+-- Design-time definition (properties, controls, layout, pages)
+-- plus the runtime hook. Runtime logic lives in runtime.lua and
+-- only executes on a running Core. build.js bundles src/ into
+-- the single .qplug file that Q-SYS Designer loads.
+-- =============================================================
+
+local Models = require("models")
+local Commands = require("commands")
+
+local model = Models.Get(Models.Default)
+
+-- Colour bar on the plugin block in the schematic.
+-- Clair Global "Patch of Blue" brand colour (#15a3d5 family).
+function GetColor(props)
+  return { 0, 210, 255 }
+end
+
+-- Block face label. Non-breaking spaces (U+00A0) stop Q-SYS from
+-- word-wrapping the title. The model is shown underneath.
+function GetPrettyName(props)
+  local nbsp = "\xC2\xA0"
+  return "Elo" .. nbsp .. "Display" .. nbsp .. "Control" .. "\n" .. model.Name
+end
+
+function GetProperties()
+  return {
+    { Name = "IP Address", Type = "string", Value = "192.168.10.100" },
+    { Name = "Port", Type = "integer", Min = 1, Max = 65535, Value = model.DefaultPort },
+    { Name = "Normal Poll Interval (s)", Type = "integer", Min = 1, Max = 60, Value = 3 },
+    { Name = "High Poll Interval (s)", Type = "integer", Min = 1, Max = 10, Value = 1 },
+    { Name = "High Poll Timeout (s)", Type = "integer", Min = 5, Max = 180, Value = 30 },
+    { Name = "Debug Print", Type = "enum", Choices = { "None", "Tx/Rx", "All" }, Value = "None" },
+  }
+end
+
+function GetControls(props)
+  local ctrls = {}
+
+  local function add(c) ctrls[#ctrls + 1] = c end
+  local function trigger(name)
+    add({ Name = name, ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true })
+  end
+  local function text(name)
+    add({ Name = name, ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true })
+  end
+  local function led(name)
+    add({ Name = name, ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true })
+  end
+  local function choice(name)
+    add({ Name = name, ControlType = "Text", PinStyle = "Both", UserPin = true })
+  end
+  local function level(name, range)
+    add({
+      Name = name, ControlType = "Knob", ControlUnit = "Integer",
+      Min = range.Min, Max = range.Max, Count = 1, PinStyle = "Both", UserPin = true,
+    })
+  end
+
+  trigger("DisplayOn")
+  trigger("DisplayOff")
+  led("DisplayState")
+  text("DisplayText")
+
+  choice("Input")
+  level("Brightness", Commands.LevelRange)
+  level("Volume", Commands.LevelRange)
+
+  text("TemperatureC")
+  text("DisplayPowerHours")
+  text("BacklightHours")
+  text("SerialNumber")
+  trigger("ReadSerial")
+
+  led("Connected")
+  add({ Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true })
+  text("StatusDetail")
+  text("Model")
+  text("IPAddress")
+
+  text("LastCommand")
+  text("LastResponse")
+  text("LastError")
+  text("QueueDepth")
+
+  add({ Name = "CustomCommand", ControlType = "Text", PinStyle = "Both", UserPin = true })
+  add({ Name = "CustomReply", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true })
+  trigger("CustomSend")
+
+  return ctrls
+end
+
+function GetControlLayout(props)
+  local layout, graphics = {}, {}
+  local TEXT = { 60, 60, 60 }
+  local PRETTY = {
+    Model = "Status~Model", Connected = "Status~Connected", IPAddress = "Status~IP Address",
+    Status = "Status~Connection", StatusDetail = "Status~Detail",
+    DisplayOn = "Display~On", DisplayOff = "Display~Off", DisplayState = "Display~State",
+    DisplayText = "Display~State Text",
+    Input = "Input~Select",
+    Brightness = "Picture~Brightness", Volume = "Audio~Volume",
+    TemperatureC = "Health~Temperature C", DisplayPowerHours = "Health~Display Power Hours",
+    BacklightHours = "Health~Backlight Hours", SerialNumber = "Health~Serial Number",
+    ReadSerial = "Health~Read Serial",
+    LastCommand = "Diagnostics~Last Command", LastResponse = "Diagnostics~Last Reply",
+    LastError = "Diagnostics~Last Error", QueueDepth = "Diagnostics~Queue Depth",
+    CustomCommand = "Raw~Command", CustomSend = "Raw~Send", CustomReply = "Raw~Reply",
+  }
+
+  -- Panel width 500px: boxes at x=5, w=490, 5px grid.
+  local function box(title, x, y, w, h)
+    graphics[#graphics + 1] = {
+      Type = "GroupBox", Text = title, Fill = { 195, 195, 195 }, StrokeWidth = 2,
+      StrokeColor = { 0, 210, 255 }, CornerRadius = 8, Position = { x, y }, Size = { w, h },
+    }
+  end
+  local function label(title, x, y, w)
+    graphics[#graphics + 1] = {
+      Type = "Text", Text = title, Position = { x, y }, Size = { w, 20 }, FontSize = 11,
+      HTextAlign = "Right", Color = TEXT,
+    }
+  end
+  local function control(name, style, x, y, w, h, extra)
+    local c = { PrettyName = PRETTY[name] or name, Style = style, Position = { x, y }, Size = { w, h }, FontSize = 12 }
+    for k, v in pairs(extra or {}) do c[k] = v end
+    layout[name] = c
+  end
+  local function button(name, legend, x, y, w, h, color)
+    control(name, "Button", x, y, w, h, { Legend = legend, Color = color })
+  end
+
+  -- Connection
+  box("Connection", 5, 5, 490, 110)
+  label("Model:", 10, 30, 75)
+  control("Model", "Text", 90, 28, 195, 22)
+  label("Connected:", 295, 30, 75)
+  control("Connected", "Led", 375, 28, 22, 22)
+  label("IP Address:", 10, 58, 75)
+  control("IPAddress", "Text", 90, 56, 390, 22)
+  label("Status:", 10, 86, 75)
+  control("Status", "Text", 90, 84, 390, 22)
+
+  -- Display (backlight) power
+  box("Display", 5, 120, 490, 60)
+  button("DisplayOn", "Display On", 10, 145, 130, 28, { 0, 200, 220 })
+  button("DisplayOff", "Display Off", 145, 145, 130, 28, { 255, 140, 0 })
+  control("DisplayState", "Led", 290, 148, 22, 22)
+  control("DisplayText", "Text", 317, 148, 140, 22)
+
+  -- Input
+  box("Input", 5, 185, 490, 55)
+  control("Input", "ComboBox", 10, 210, 250, 24)
+
+  -- Levels
+  box("Picture and Audio", 5, 245, 490, 85)
+  label("Brightness:", 10, 272, 75)
+  control("Brightness", "Fader", 90, 270, 300, 24, { ShowTextbox = true })
+  label("Volume:", 10, 300, 75)
+  control("Volume", "Fader", 90, 298, 300, 24, { ShowTextbox = true })
+
+  -- Health
+  box("Health", 5, 335, 490, 85)
+  label("Temp (C):", 10, 360, 75)
+  control("TemperatureC", "Text", 90, 358, 100, 22)
+  label("Serial:", 200, 360, 75)
+  control("SerialNumber", "Text", 280, 358, 120, 22)
+  button("ReadSerial", "Read", 405, 356, 75, 26, { 0, 200, 220 })
+  label("Display Hrs:", 10, 388, 75)
+  control("DisplayPowerHours", "Text", 90, 386, 100, 22)
+  label("Backlight Hrs:", 190, 388, 85)
+  control("BacklightHours", "Text", 280, 386, 120, 22)
+
+  -- Diagnostics
+  box("Diagnostics", 5, 425, 490, 160)
+  label("Detail:", 10, 450, 75)
+  control("StatusDetail", "Text", 90, 448, 390, 22)
+  label("Last Cmd:", 10, 476, 75)
+  control("LastCommand", "Text", 90, 474, 390, 22)
+  label("Last Reply:", 10, 502, 75)
+  control("LastResponse", "Text", 90, 500, 390, 22)
+  label("Last Error:", 10, 528, 75)
+  control("LastError", "Text", 90, 526, 390, 22)
+  label("Queue:", 10, 554, 75)
+  control("QueueDepth", "Text", 90, 552, 60, 22)
+
+  -- Raw command testing
+  box("Raw Hex Command", 5, 590, 490, 75)
+  control("CustomCommand", "TextBox", 15, 616, 270, 24)
+  button("CustomSend", "Send", 290, 614, 60, 28, { 0, 200, 220 })
+  control("CustomReply", "Text", 355, 616, 130, 22)
+
+  return layout, graphics
+end
+
+function GetPages(props)
+  return { { name = "Control" } }
+end
+
+-- Runtime only: Controls does not exist at design time.
+if Controls then
+  require("runtime")()
+end

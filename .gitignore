@@ -1,0 +1,10 @@
+
+# Local reference docs - not intended for GitHub
+Elo_6554L_QSYS_Reference/
+
+# Tooling
+node_modules/
+
+# Common local/editor noise
+.DS_Store
+Thumbs.db
