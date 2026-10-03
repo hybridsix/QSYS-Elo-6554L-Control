@@ -1,6 +1,6 @@
 # Elo 6554L Control - Q-SYS Plugin
 
-**Author:** Michael King / Hybridsix  **Version:** 0.1.2  **Platform:** Q-SYS Designer, Elo 6554L (ET6554L, IDS54 family)
+**Author:** Michael King / Hybridsix  **Version:** 0.1.3  **Platform:** Q-SYS Designer, Elo 6554L (ET6554L, IDS54 family)
 
 A Q-SYS plugin that gives your Core direct control over an Elo 6554L interactive display on the local network - display on / off, input, brightness, volume, and live status, all from the schematic.
 

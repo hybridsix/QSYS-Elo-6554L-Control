@@ -29,13 +29,18 @@ local function deviceName(props, default)
   return (name:gsub(" ", "\xC2\xA0"))
 end
 
+-- Keeps a label on one line: spaces become non-breaking and hyphens become
+-- non-breaking hyphens (U+2011), which Q-SYS would otherwise wrap at.
+local function noBreak(s)
+  return (s:gsub(" ", "\xC2\xA0"):gsub("-", "\xE2\x80\x91"))
+end
 -- Block face label. Non-breaking spaces (U+00A0) stop Q-SYS from
 -- word-wrapping the title. The Name property replaces the title when set;
 -- the model is shown underneath.
 function GetPrettyName(props)
   local nbsp = "\xC2\xA0"
   local title = "Elo" .. nbsp .. "Display" .. nbsp .. "Control"
-  return deviceName(props, title) .. "\n" .. model.Name
+  return deviceName(props, title) .. "\n" .. noBreak(model.Name)
 end
 
 function GetProperties()

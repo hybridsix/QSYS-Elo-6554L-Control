@@ -81,7 +81,7 @@ T.test("every laid-out control is defined, with no duplicates", function()
   end
   T.truthy(#graphics > 0)
   T.eq(#GetPages(props), 1)
-  T.truthy(GetPrettyName(props):find("Elo 6554L", 1, true))
+  T.truthy(GetPrettyName(props):find("Elo\xC2\xA06554L", 1, true))
 end)
 
 T.test("the version 1 controls exist", function()
