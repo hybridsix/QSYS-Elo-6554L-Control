@@ -14,7 +14,7 @@
 -- =============================================================
 
 PluginInfo = {
-  Name = "Displays~Elo~Elo 6554L Control",
+  Name = "Hybridsix Software~Displays~Elo~Elo 6554L Control",
   Version = "@VERSION@",
   BuildVersion = "@VERSION@.0",
   Id = "791af0df-abb0-47c2-ad28-6580e602d157",

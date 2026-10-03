@@ -25,7 +25,7 @@ local function propsFromDefaults(overrides)
 end
 
 T.test("PluginInfo is complete", function()
-  T.eq(PluginInfo.Name, "Displays~Elo~Elo 6554L Control")
+  T.eq(PluginInfo.Name, "Hybridsix Software~Displays~Elo~Elo 6554L Control")
   T.truthy(PluginInfo.Id:match("^%x+%-%x+%-%x+%-%x+%-%x+$"))
   T.truthy(PluginInfo.Version:match("^%d+%.%d+%.%d+$"), "version placeholder not replaced")
 end)

@@ -14,9 +14,9 @@
 -- =============================================================
 
 PluginInfo = {
-  Name = "Displays~Elo~Elo 6554L Control",
-  Version = "0.1.1",
-  BuildVersion = "0.1.1.0",
+  Name = "Hybridsix Software~Displays~Elo~Elo 6554L Control",
+  Version = "0.1.2",
+  BuildVersion = "0.1.2.0",
   Id = "791af0df-abb0-47c2-ad28-6580e602d157",
   Author = "Michael King",
   Description = "Control the Elo 6554L (ET6554L) interactive display from Q-SYS: display on / off (backlight), input, brightness and volume over Elo MDC on TCP port 5000, with temperature and usage-hour feedback.",

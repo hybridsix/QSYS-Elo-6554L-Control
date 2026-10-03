@@ -1,6 +1,6 @@
 # Elo 6554L Control - Q-SYS Plugin
 
-**Author:** Michael King / Hybridsix  **Version:** 0.1.1  **Platform:** Q-SYS Designer, Elo 6554L (ET6554L, IDS54 family)
+**Author:** Michael King / Hybridsix  **Version:** 0.1.2  **Platform:** Q-SYS Designer, Elo 6554L (ET6554L, IDS54 family)
 
 A Q-SYS plugin that gives your Core direct control over an Elo 6554L interactive display on the local network - display on / off, input, brightness, volume, and live status, all from the schematic.
 
@@ -53,7 +53,7 @@ No username or password is used; raw MDC over TCP has no authentication.
 1. Download `Elo6554LControl.qplug` from the latest release, or use the copy in `dist/`
 2. Copy it to: `%USERPROFILE%\Documents\QSC\Q-Sys Designer\Plugins\QSYS Elo 6554L Control\`
 3. Restart Q-SYS Designer (or use Manage Plugins to reload)
-4. Drag Displays -> Elo -> Elo 6554L Control from the component library onto your schematic
+4. Drag Hybridsix Software -> Displays -> Elo -> Elo 6554L Control from the component library onto your schematic
 5. Open the plugin's Properties panel and fill in:
 
 | Property | Description |

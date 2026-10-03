@@ -1,6 +1,6 @@
 {
   "name": "qsys-elo-6554l-control",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Q-SYS plugin for the Elo 6554L (ET6554L) interactive display",
   "private": true,
   "scripts": {
