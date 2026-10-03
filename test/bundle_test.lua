@@ -25,9 +25,19 @@ local function propsFromDefaults(overrides)
 end
 
 T.test("PluginInfo is complete", function()
-  T.truthy(PluginInfo.Name:find("Elo 6554L", 1, true))
+  T.eq(PluginInfo.Name, "Displays~Elo~Elo 6554L Control")
   T.truthy(PluginInfo.Id:match("^%x+%-%x+%-%x+%-%x+%-%x+$"))
   T.truthy(PluginInfo.Version:match("^%d+%.%d+%.%d+$"), "version placeholder not replaced")
+end)
+T.test("the Name property replaces the block title when set", function()
+  local props = propsFromDefaults()
+  T.truthy(GetPrettyName(props):find("Control", 1, true))
+  props["Name"].Value = "PRJ 201"
+  local label = GetPrettyName(props)
+  T.truthy(label:find("PRJ\xC2\xA0201", 1, true))
+  T.falsy(label:find("Control", 1, true))
+  props["Name"].Value = "  "
+  T.truthy(GetPrettyName(props):find("Control", 1, true))
 end)
 
 T.test("property names are unique and defaults are valid", function()

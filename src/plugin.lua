@@ -20,15 +20,27 @@ function GetColor(props)
   return { 0, 210, 255 }
 end
 
+-- Device name from the Name property (e.g. "PRJ-201"); spaces become
+-- non-breaking so the block face does not word-wrap it.
+local function deviceName(props, default)
+  local p = props["Name"]
+  local name = p and p.Value or ""
+  if name:match("^%s*$") then return default end
+  return (name:gsub(" ", "\xC2\xA0"))
+end
+
 -- Block face label. Non-breaking spaces (U+00A0) stop Q-SYS from
--- word-wrapping the title. The model is shown underneath.
+-- word-wrapping the title. The Name property replaces the title when set;
+-- the model is shown underneath.
 function GetPrettyName(props)
   local nbsp = "\xC2\xA0"
-  return "Elo" .. nbsp .. "Display" .. nbsp .. "Control" .. "\n" .. model.Name
+  local title = "Elo" .. nbsp .. "Display" .. nbsp .. "Control"
+  return deviceName(props, title) .. "\n" .. model.Name
 end
 
 function GetProperties()
   return {
+    { Name = "Name", Type = "string", Value = "" },
     { Name = "IP Address", Type = "string", Value = "192.168.10.100" },
     { Name = "Port", Type = "integer", Min = 1, Max = 65535, Value = model.DefaultPort },
     { Name = "Normal Poll Interval (s)", Type = "integer", Min = 1, Max = 60, Value = 3 },
